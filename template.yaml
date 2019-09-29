@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Create CloudWatch Alarm for each new created instance"
+
+Parameters:
+  SNSTopic:
+    Description: SNS topic ARN to send alarm message to.
+    Type: String
+
+Resources:
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies: 
+        - PolicyName: "CWAlarm"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement: 
+              - Effect: "Allow"
+                Action: ["cloudwatch:DescribeAlarms", "cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms"]
+                Resource: "*"
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "EC2 running event"
+      EventPattern: 
+        source: 
+          - "aws.ec2"
+        detail-type: 
+          - "EC2 Instance State-change Notification"
+        detail: 
+          state: 
+            - "running"
+            - "terminated"
+      State: ENABLED
+      Targets: 
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: "NewEC2EventRule"
+  LambdaSchedulePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt EventRule.Arn
+  LambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: Lambda function that returns 'Hello World!'
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+            instanceid = event['detail']['instance-id']
+            sate = event['detail']['state']
+            alarm_name = "%s High CPU Utilization Warning" % (instanceid)
+            existed_alarms = len(cloudwatch.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"])
+
+            if sate == 'running' and existed_alarms == 0:
+              print("Creating new" + alarm_name)
+              # Create Metric "CPU Utilization Greater than 95% for 15+ Minutes"
+              response = cloudwatch.put_metric_alarm(
+                AlarmName=alarm_name,
+                AlarmDescription='CPU Utilization Greater than 95% for 15+ Minutes',
+                ActionsEnabled=True,
+                AlarmActions=[
+                  '${SNSTopic}'
+                ],
+                MetricName='CPUUtilization',
+                Namespace='AWS/EC2',
+                Statistic='Average',
+                Dimensions=[
+                  {
+                    'Name': 'InstanceId',
+                    'Value': instanceid
+                  },
+                ],
+                Period=300,
+                EvaluationPeriods=3,
+                Threshold=95.0,
+                ComparisonOperator='GreaterThanOrEqualToThreshold',
+                Tags=[
+                  {
+                    'Key': 'ManagedByWhe',
+                    'Value': 'Yes'
+                  },
+                ]
+              )
+            elif sate == 'terminated' and existed_alarms > 0:
+              print("Deleting alarm " + alarm_name)
+              cloudwatch.delete_alarms(AlarmNames=[alarm_name])
+
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.6
+      Timeout: 60
